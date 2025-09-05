@@ -26,6 +26,7 @@ document.addEventListener('DOMContentLoaded', () => {
     let stickers = [];
     let activeStickerId = null;
     let dragContext = null;
+    let pinchContext = null; // For mobile pinch-to-zoom
     const stickerImageCache = {};
 
     const getSelectedSticker = () => stickers.find(s => s.id === activeStickerId);
@@ -61,7 +62,7 @@ document.addEventListener('DOMContentLoaded', () => {
             ctx.translate(selectedSticker.x + w / 2, selectedSticker.y + h / 2);
             ctx.rotate(selectedSticker.rotation * Math.PI / 180);
             ctx.strokeStyle = '#F97316';
-            ctx.lineWidth = 8; // Increased for visibility at 1024px
+            ctx.lineWidth = 8;
             ctx.strokeRect(-w / 2, -h / 2, w, h);
             ctx.restore();
         }
@@ -142,11 +143,15 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     });
 
-    const getCanvasCoords = e => {
+    // --- Canvas Interaction ---
+
+    const getCanvasCoords = (e) => {
         const rect = canvas.getBoundingClientRect();
+        const pointer = e.touches ? e.touches[0] : e;
+        if (!pointer) return { x: 0, y: 0 };
         return {
-            x: (e.clientX - rect.left) / rect.width * CANVAS_SIZE,
-            y: (e.clientY - rect.top) / rect.height * CANVAS_SIZE,
+            x: (pointer.clientX - rect.left) / rect.width * CANVAS_SIZE,
+            y: (pointer.clientY - rect.top) / rect.height * CANVAS_SIZE,
         };
     };
     
@@ -156,23 +161,40 @@ document.addEventListener('DOMContentLoaded', () => {
         return coords.x >= image.x && coords.x <= image.x + w && coords.y >= image.y && coords.y <= image.y + h;
     };
 
+    const findTargetAt = (coords) => {
+        const targetSticker = [...stickers].reverse().find(s => isPointerInImage(coords, s));
+        if (targetSticker) return targetSticker;
+        if (background && isPointerInImage(coords, background)) return background;
+        return null;
+    };
+
+    const applyScale = (target, newScale, zoomCenter) => {
+        const oldW = target.width * target.scale;
+        const newW = target.width * newScale;
+        const oldH = target.height * target.scale;
+        const newH = target.height * newScale;
+
+        target.scale = newScale;
+        if (oldW > 0 && oldH > 0) {
+            target.x -= ((zoomCenter.x - target.x) / oldW) * (newW - oldW);
+            target.y -= ((zoomCenter.y - target.y) / oldH) * (newH - oldH);
+        }
+    };
+    
+    // Mouse Handlers
     canvas.addEventListener('mousedown', e => {
         const coords = getCanvasCoords(e);
-        for (let i = stickers.length - 1; i >= 0; i--) {
-            if (isPointerInImage(coords, stickers[i])) {
-                activeStickerId = stickers[i].id;
-                dragContext = { target: 'sticker', id: stickers[i].id, x: coords.x, y: coords.y, imgX: stickers[i].x, imgY: stickers[i].y };
-                updateUI();
-                return;
-            }
-        }
-        if (background && isPointerInImage(coords, background)) {
+        const target = findTargetAt(coords);
+
+        if (target && stickers.includes(target)) {
+            activeStickerId = target.id;
+            dragContext = { target, x: coords.x, y: coords.y, imgX: target.x, imgY: target.y };
+        } else if (target) {
             activeStickerId = null;
-            dragContext = { target: 'background', x: coords.x, y: coords.y, imgX: background.x, imgY: background.y };
-            updateUI();
-            return;
+            dragContext = { target, x: coords.x, y: coords.y, imgX: target.x, imgY: target.y };
+        } else {
+            activeStickerId = null;
         }
-        activeStickerId = null;
         updateUI();
     });
 
@@ -181,59 +203,104 @@ document.addEventListener('DOMContentLoaded', () => {
         const coords = getCanvasCoords(e);
         const dx = coords.x - dragContext.x;
         const dy = coords.y - dragContext.y;
-        if (dragContext.target === 'background' && background) {
-            background.x = dragContext.imgX + dx;
-            background.y = dragContext.imgY + dy;
-        } else if (dragContext.target === 'sticker') {
-            const sticker = getSelectedSticker();
-            if (sticker) {
-                sticker.x = dragContext.imgX + dx;
-                sticker.y = dragContext.imgY + dy;
-            }
-        }
+        dragContext.target.x = dragContext.imgX + dx;
+        dragContext.target.y = dragContext.imgY + dy;
         drawCanvas();
     });
-    
-    const endDrag = () => {
-        dragContext = null;
-        updateUI();
-    };
-    canvas.addEventListener('mouseup', endDrag);
-    canvas.addEventListener('mouseleave', endDrag);
 
     canvas.addEventListener('wheel', e => {
         if (!background) return;
         e.preventDefault();
         const coords = getCanvasCoords(e);
-        
-        let target = null;
-        const targetSticker = [...stickers].reverse().find(s => isPointerInImage(coords, s));
-        
-        if (targetSticker) {
-            target = targetSticker;
-        } else if (isPointerInImage(coords, background)) {
-            target = background;
-        }
-
+        const target = findTargetAt(coords);
         if (!target) return;
 
         const scaleAmount = -e.deltaY * 0.001;
         const newScale = Math.max(0.05, target.scale + scaleAmount);
-        const oldW = target.width * target.scale;
-        const newW = target.width * newScale;
-        const oldH = target.height * target.scale;
-        const newH = target.height * newScale;
-
-        target.scale = newScale;
-        target.x = target.x - ((coords.x - target.x) / oldW) * (newW - oldW);
-        target.y = target.y - ((coords.y - target.y) / oldH) * (newH - oldH);
+        applyScale(target, newScale, coords);
         
-        if(targetSticker) {
+        if(stickers.includes(target)) {
             scaleSlider.value = newScale;
         }
-
         drawCanvas();
     });
+
+    // Touch Handlers
+    const getTouchDistance = (t1, t2) => Math.sqrt(Math.pow(t1.clientX - t2.clientX, 2) + Math.pow(t1.clientY - t2.clientY, 2));
+    const getTouchMidpoint = (t1, t2) => {
+        const rect = canvas.getBoundingClientRect();
+        const midX = (t1.clientX + t2.clientX) / 2;
+        const midY = (t1.clientY + t2.clientY) / 2;
+        return { x: (midX - rect.left) * (CANVAS_SIZE / rect.width), y: (midY - rect.top) * (CANVAS_SIZE / rect.height) };
+    };
+
+    canvas.addEventListener('touchstart', e => {
+        if (!background) return;
+        e.preventDefault();
+        const touches = e.touches;
+
+        if (touches.length === 1) {
+            pinchContext = null;
+            const coords = getCanvasCoords(e);
+            const target = findTargetAt(coords);
+            if (target && stickers.includes(target)) {
+                activeStickerId = target.id;
+                dragContext = { target, x: coords.x, y: coords.y, imgX: target.x, imgY: target.y };
+            } else if (target) {
+                activeStickerId = null;
+                dragContext = { target, x: coords.x, y: coords.y, imgX: target.x, imgY: target.y };
+            } else {
+                activeStickerId = null;
+            }
+            updateUI();
+        } else if (touches.length === 2) {
+            dragContext = null;
+            const midpoint = getTouchMidpoint(touches[0], touches[1]);
+            const target = findTargetAt(midpoint);
+            if (target) {
+                pinchContext = { target, initialDistance: getTouchDistance(touches[0], touches[1]), initialScale: target.scale };
+            }
+        }
+    }, { passive: false });
+
+    canvas.addEventListener('touchmove', e => {
+        if (!background) return;
+        e.preventDefault();
+        const touches = e.touches;
+
+        if (touches.length === 1 && dragContext) {
+            const coords = getCanvasCoords(e);
+            const dx = coords.x - dragContext.x;
+            const dy = coords.y - dragContext.y;
+            dragContext.target.x = dragContext.imgX + dx;
+            dragContext.target.y = dragContext.imgY + dy;
+            drawCanvas();
+        } else if (touches.length === 2 && pinchContext) {
+            const { target, initialDistance, initialScale } = pinchContext;
+            const newDistance = getTouchDistance(touches[0], touches[1]);
+            const scaleFactor = newDistance / initialDistance;
+            const newScale = Math.max(0.05, initialScale * scaleFactor);
+            const midpoint = getTouchMidpoint(touches[0], touches[1]);
+            applyScale(target, newScale, midpoint);
+
+            if (stickers.includes(target)) {
+                scaleSlider.value = newScale;
+            }
+            drawCanvas();
+        }
+    }, { passive: false });
+
+    const endInteraction = () => {
+        dragContext = null;
+        pinchContext = null;
+        updateUI();
+    };
+
+    canvas.addEventListener('mouseup', endInteraction);
+    canvas.addEventListener('mouseleave', endInteraction);
+    canvas.addEventListener('touchend', endInteraction);
+    canvas.addEventListener('touchcancel', endInteraction);
+
 
     // Controls listeners
     rotateSlider.addEventListener('input', e => {
